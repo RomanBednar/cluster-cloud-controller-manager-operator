@@ -78,7 +78,8 @@ func Test_mergeCloudConfig(t *testing.T) {
 			name:           "AZURE_CLIENT_SECRET not set",
 			args:           []string{"--cloud-config-file-path", inputFile.Name(), "--output-file-path", outputFile.Name()},
 			envVars:        map[string]string{"AZURE_CLIENT_ID": "foo"},
-			expectedErrMsg: "AZURE_CLIENT_SECRET env variable should be set up",
+			fileContent:    "{}",
+			expectedErrMsg: "could not configure authentication method: enabling client secret authentication failed because AZURE_CLIENT_SECRET variable is missing",
 		},
 		{
 			name:           "input file content is not a valid json",
@@ -158,22 +159,23 @@ func Test_mergeCloudConfig(t *testing.T) {
 			expectedContent: "{\"aadClientId\":\"buzz\",\"aadFederatedTokenFile\":\"baz\",\"tenantId\":\"bar\",\"useFederatedWorkloadIdentityExtension\":true}",
 		},
 		{
-			name:           "should fail, client secret is present while workload identity is enabled",
-			args:           []string{"--cloud-config-file-path", inputFile.Name(), "--output-file-path", outputFile.Name(), "--disable-identity-extension-auth", "--enable-azure-workload-identity=true"},
-			envVars:        map[string]string{"AZURE_TENANT_ID": "baz", "AZURE_CLIENT_ID": "foo", "AZURE_CLIENT_SECRET": "bar", "AZURE_FEDERATED_TOKEN_FILE": "baz"},
-			expectedErrMsg: "AZURE_CLIENT_SECRET env variable is set while workload identity is enabled, this should never happen.\nPlease consider reporting a bug: https://issues.redhat.com",
+			name:            "all ok, only warn about client secret presence while workload identity is enabled",
+			args:            []string{"--cloud-config-file-path", inputFile.Name(), "--output-file-path", outputFile.Name(), "--disable-identity-extension-auth", "--enable-azure-workload-identity=true"},
+			envVars:         map[string]string{"AZURE_TENANT_ID": "baz", "AZURE_CLIENT_ID": "foo", "AZURE_CLIENT_SECRET": "bar", "AZURE_FEDERATED_TOKEN_FILE": "baz"},
+			fileContent:     "{}",
+			expectedContent: "{\"aadClientId\":\"foo\",\"aadFederatedTokenFile\":\"baz\",\"tenantId\":\"baz\",\"useFederatedWorkloadIdentityExtension\":true}",
 		},
 		{
 			name:           "should fail, workload identity can't be enabled because tenant id missing",
 			args:           []string{"--cloud-config-file-path", inputFile.Name(), "--output-file-path", outputFile.Name(), "--disable-identity-extension-auth", "--enable-azure-workload-identity=true"},
 			envVars:        map[string]string{"AZURE_CLIENT_ID": "buzz", "AZURE_FEDERATED_TOKEN_FILE": "baz"},
-			expectedErrMsg: "workload identity method failed: AZURE_TENANT_ID environment variable not found or empty",
+			expectedErrMsg: "could not configure authentication method: Workload identity feature should be enabled but required variables are missing: [AZURE_TENANT_ID]\nFalling back to using client secret also failed because AZURE_CLIENT_SECRET variable is missing.",
 		},
 		{
 			name:           "should fail, workload identity can't be enabled because federated token missing",
 			args:           []string{"--cloud-config-file-path", inputFile.Name(), "--output-file-path", outputFile.Name(), "--disable-identity-extension-auth", "--enable-azure-workload-identity=true"},
 			envVars:        map[string]string{"AZURE_TENANT_ID": "bar", "AZURE_CLIENT_ID": "buzz"},
-			expectedErrMsg: "workload identity method failed: AZURE_FEDERATED_TOKEN_FILE environment variable not found or empty",
+			expectedErrMsg: "could not configure authentication method: Workload identity feature should be enabled but required variables are missing: [AZURE_FEDERATED_TOKEN_FILE]\nFalling back to using client secret also failed because AZURE_CLIENT_SECRET variable is missing.",
 		},
 	}
 

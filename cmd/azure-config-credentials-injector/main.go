@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"os"
-
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
+	"os"
 )
 
 const (
@@ -57,12 +56,8 @@ func main() {
 
 func mergeCloudConfig(_ *cobra.Command, args []string) error {
 	var (
-		azureClientId      string
-		azureClientSecret  string
-		tenantId           string
-		federatedTokenFile string
-		secretFound        bool
-		err                error
+		azureClientId string
+		err           error
 	)
 
 	if _, err := os.Stat(injectorOpts.cloudConfigFilePath); os.IsNotExist(err) {
@@ -74,21 +69,9 @@ func mergeCloudConfig(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("%s env variable should be set up", clientIDEnvKey)
 	}
 
-	azureClientSecret, secretFound = mustLookupEnvValue(clientSecretEnvKey)
-
-	// Ensure there is only one authentication method.
-	if injectorOpts.enableWorkloadIdentity == "true" {
-		tenantId, federatedTokenFile, err = lookupWorkloadIdentityEnv(tenantIDEnvKey, federatedTokenEnvKey)
-		if err != nil {
-			return fmt.Errorf("workload identity method failed: %v", err)
-		}
-		if secretFound {
-			return fmt.Errorf("%s env variable is set while workload identity is enabled, this should never happen.\nPlease consider reporting a bug: https://issues.redhat.com", clientSecretEnvKey)
-		}
-	} else {
-		if !secretFound {
-			return fmt.Errorf("%s env variable should be set up", clientSecretEnvKey)
-		}
+	authConfig, err := prepareAuthConfig(injectorOpts.enableWorkloadIdentity)
+	if err != nil {
+		return fmt.Errorf("could not configure authentication method: %w", err)
 	}
 
 	cloudConfig, err := readCloudConfig(injectorOpts.cloudConfigFilePath)
@@ -96,7 +79,7 @@ func mergeCloudConfig(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("couldn't read cloud config from file: %w", err)
 	}
 
-	preparedCloudConfig, err := prepareCloudConfig(cloudConfig, azureClientId, azureClientSecret, tenantId, federatedTokenFile)
+	preparedCloudConfig, err := prepareCloudConfig(cloudConfig, authConfig, azureClientId)
 	if err != nil {
 		return fmt.Errorf("couldn't prepare cloud config: %w", err)
 	}
@@ -121,7 +104,76 @@ func readCloudConfig(path string) (map[string]interface{}, error) {
 	return data, nil
 }
 
-func prepareCloudConfig(cloudConfig map[string]interface{}, clientId, clientSecret, tenantId, federatedTokenFile string) ([]byte, error) {
+func prepareAuthConfig(workloadIdentityOpt string) (authConfig map[string]interface{}, err error) {
+	authConfig = map[string]interface{}{}
+	workloadIdentityRequested := false
+	if opt := workloadIdentityOpt; opt == "true" {
+		workloadIdentityRequested = true
+	}
+
+	clientSecret, secretAvailable := mustLookupEnvValue(clientSecretEnvKey)
+	tenantId, tenantIdFound := mustLookupEnvValue(tenantIDEnvKey)
+	federatedTokenFile, federatedTokenFileFound := mustLookupEnvValue(federatedTokenEnvKey)
+	canSetupWorkloadIdentity := tenantIdFound && federatedTokenFileFound
+
+	useSecret := func() {
+		authConfig[clientSecretCloudConfigKey] = clientSecret
+	}
+
+	useWorkloadIdentity := func() {
+		authConfig[tenantIdConfigKey] = tenantId
+		authConfig[aadFederatedTokenFileConfigKey] = federatedTokenFile
+		authConfig[useFederatedWorkloadIdentityExtensionConfigKey] = true
+	}
+
+	getMissingWorkloadValues := func() []string {
+		var missing []string
+		if workloadIdentityRequested {
+			if !tenantIdFound {
+				missing = append(missing, tenantIDEnvKey)
+			}
+			if !federatedTokenFileFound {
+				missing = append(missing, federatedTokenEnvKey)
+			}
+		} else {
+			if !secretAvailable {
+				missing = append(missing, clientSecretEnvKey)
+			}
+		}
+
+		return missing
+	}
+
+	switch {
+	// All cases when workload identity was requested and should be enabled if possible.
+	case workloadIdentityRequested && !canSetupWorkloadIdentity && secretAvailable:
+		useSecret()
+		klog.Warningf("Workload identity feature should be enabled but required variables are missing: %v\nFalling back to using client secret.", getMissingWorkloadValues())
+	case workloadIdentityRequested && !canSetupWorkloadIdentity && !secretAvailable:
+		err = fmt.Errorf("Workload identity feature should be enabled but required variables are missing: %v\nFalling back to using client secret also failed because %v variable is missing.", getMissingWorkloadValues(), clientSecretEnvKey)
+	case workloadIdentityRequested && canSetupWorkloadIdentity && secretAvailable:
+		useWorkloadIdentity()
+		klog.Warningf("Enabling workload identity feature but %v variable was found while it should not be present\nPlease consider reporting a bug: https://issues.redhat.com", clientSecretEnvKey)
+	case workloadIdentityRequested && canSetupWorkloadIdentity && !secretAvailable:
+		klog.Infof("Enabling workload identity feature.")
+		useWorkloadIdentity()
+	// All cases when workload identity was *not* requested and should stay disabled even if all values are available.
+	case !workloadIdentityRequested && !canSetupWorkloadIdentity && !secretAvailable:
+		err = fmt.Errorf("enabling client secret authentication failed because %v variable is missing", clientSecretEnvKey)
+	case !workloadIdentityRequested && !canSetupWorkloadIdentity && secretAvailable:
+		useSecret()
+		klog.Infof("Enabling client secret authentication.")
+	case !workloadIdentityRequested && canSetupWorkloadIdentity && secretAvailable:
+		useSecret()
+		klog.Warningf("Enabling client secret authentication, but workload identity values were found %v, %v\nPlease consider reporting a bug: https://issues.redhat.com", tenantId, federatedTokenFile)
+	case !workloadIdentityRequested && canSetupWorkloadIdentity && !secretAvailable:
+		err = fmt.Errorf("enabling client secret authentication failed because %v variable is missing\nWorkload identity is available, but can not be used because it is explicitly disabled.", clientSecretEnvKey)
+	}
+
+	return
+}
+
+func prepareCloudConfig(cloudConfig, authConfig map[string]interface{}, clientId string) ([]byte, error) {
 	cloudConfig[clientIDCloudConfigKey] = clientId
 
 	if value, found := cloudConfig[useManagedIdentityExtensionConfigKey]; found {
@@ -135,13 +187,8 @@ func prepareCloudConfig(cloudConfig map[string]interface{}, clientId, clientSecr
 		}
 	}
 
-	if len(tenantId) != 0 && len(federatedTokenFile) != 0 {
-		cloudConfig[tenantIdConfigKey] = tenantId
-		cloudConfig[aadFederatedTokenFileConfigKey] = federatedTokenFile
-		cloudConfig[useFederatedWorkloadIdentityExtensionConfigKey] = true
-	} else {
-		klog.V(4).Info("%s env variable is set, client secret authentication will be used", clientSecretEnvKey)
-		cloudConfig[clientSecretCloudConfigKey] = clientSecret
+	for k, v := range authConfig {
+		cloudConfig[k] = v
 	}
 
 	marshalled, err := json.Marshal(cloudConfig)
